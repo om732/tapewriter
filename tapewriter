@@ -1,0 +1,220 @@
+#!/usr/bin/env python
+# -*-coding:utf-8-*-
+# -*- mode: python -*-
+# vi: set ft=python :
+import os
+import sys
+import json
+import logging
+import codecs
+import ConfigParser
+import boto.ec2 as ec2
+
+from datetime import datetime
+from optparse import OptionParser
+from ansicolor import Colors,colorize
+
+# logの初期化
+logging.basicConfig(format='[%(levelname)s] %(asctime)s %(message)s', datefmt='%Y/%m/%d %H:%M:%S', level=logging.INFO)
+
+# 分離したリージョンのリスト
+# これらのリージョンは対象外
+# http://docs.aws.amazon.com/ja_jp/general/latest/gr/isolated_regions.html
+isolated_regions = ["cn-north-1", "us-gov-west-1"]
+
+# 出力
+def output(data, output):
+    if output:
+        fp = codecs.open(output, "w", "utf-8")
+        json.dump(data, fp, indent=2, sort_keys=True)
+    else:
+        print json.dumps(data, indent=2, sort_keys=True)
+
+# 読み込み
+def input_json(file_path):
+    data = None
+    with codecs.open(file_path, "r", "utf-8") as f:
+        data = json.load(f)
+    return data
+
+# ec2に接続
+def connect(aws_access_key, aws_secret_key, regions):
+    return { region: ec2.connect_to_region(region, aws_access_key_id = aws_access_key, aws_secret_access_key = aws_secret_key) for region in regions }
+
+# タグの取得
+def describe(connections, filters={}):
+    data = {
+        "instances": []
+    }
+    for region,connection in connections.items():
+        if connection is not None:
+            for instances in connection.get_all_instances(filters=filters):
+                instance_data = {}
+                instance = instances.instances[0]
+                instance_data["id"]     = instance.id
+                instance_data["region"] = region
+                instance_data["tags"]   = instance.tags
+                data["instances"].append(instance_data)
+        else:
+            logging.warning(region + " is not defined")
+    return data
+
+# 現在のタグ設定と適用するタグの比較
+def diff(to_data, from_data):
+    result = []
+    to_taglist   = { v["id"]: { "tags": set(v["tags"].items()), "region": v["region"]} for v in to_data["instances"] }
+    from_taglist = { v["id"]: { "tags": set(v["tags"].items()), "region": v["region"]} for v in from_data["instances"] }
+    for instance_id,data in to_taglist.items():
+        if not from_taglist.has_key(instance_id):
+            logging.warning("Instance(id: " + instance_id + ") is not found")
+            continue
+        to_tags   = data["tags"]
+        from_tags = from_taglist[instance_id]["tags"]
+        au = dict(from_tags - to_tags)
+        du = dict(to_tags - from_tags)
+        item = {}
+        if au:
+            while au:
+                tag = au.popitem()
+                item[tag[0]] = {
+                    "from": tag[1],
+                    "to"  : du.pop(tag[0]) if du.has_key(tag[0]) else None
+                }
+
+        if du:
+             while du:
+                tag = du.popitem()
+                item[tag[0]] = {
+                    "from": None,
+                    "to": tag[1]
+                }
+
+        if item:
+            tags = dict(to_tags)
+            item_id = tags["Name"] if tags.has_key("Name") else instance_id
+            result.append({
+                "instance_id": instance_id,
+                "region"     : data["region"],
+                "name"       : tags["Name"] if tags.has_key("Name") else None,
+                "tags_state" : item
+            })
+    return result
+
+# filterの作成
+def create_filter(item):
+    filters = {}
+    for k,v in item.items():
+        if v:
+            filters['tag:'+k] = v
+        else:
+            filters['tag-key'] = k
+    return filters
+
+# タグの追加
+def add_tag(connection, instance_id, tags):
+    return connection.create_tags([instance_id], tags)
+
+# タグの削除
+def del_tag(connection, instance_id, tags):
+    return connection.delete_tags([instance_id], tags)
+
+# bootstrap
+def main():
+    # options
+    parser = OptionParser()
+    parser.add_option("-k", "--aws_access_key", action="store", type="string", dest="aws_access_key", help="aws access key",      default=None)
+    parser.add_option("-s", "--aws_secret_key", action="store", type="string", dest="aws_secret_key", help="aws secret key",      default=None)
+    parser.add_option("-r", "--region",         action="store", type="string", dest="region",         help="export region name",  default=None)
+    parser.add_option("-c", "--credentials",    action="store", type="string", dest="credentials",    help="credential file",     default=None)
+    parser.add_option("-p", "--profile",        action="store", type="string", dest="profile",        help="credential profile",  default="default")
+    parser.add_option("-f", "--file",           action="store", type="string", dest="file",           help="json file name",      default=None)
+    parser.add_option("-e", "--export",         action="store_true",           dest="export",         help="export",              default=False)
+    parser.add_option("-a", "--apply",          action="store_true",           dest="apply",          help="apply to AWS tags",   default=False)
+    parser.add_option(      "--filter",         action="store", type="string", dest="filter",         help="export filter",       default={})
+    parser.add_option(      "--dry-run",        action="store_true",           dest="dry_run",        help="compare to AWS tags", default=False)
+    (options, args) = parser.parse_args()
+
+    # 取得対象とするregionの処理
+    regions = options.region.split(",") if options.region else [ str(region.name) for region in ec2.regions() ]
+    # 分離したリージョンが含まれていると、エラーとなるため除去する
+    regions = set(regions) - set(isolated_regions)
+
+    # awsの認証関連の処理
+    if options.aws_access_key and options.aws_secret_key:
+        connections = connect(options.aws_access_key, options.aws_secret_key, regions)
+    elif options.credentials:
+        if os.path.exists(options.credentials):
+            credential = ConfigParser.SafeConfigParser()
+            credential.read(options.credentials)
+            aws_access_key = credential.get(options.profile, 'aws_access_key_id')
+            aws_secret_key = credential.get(options.profile, 'aws_secret_access_key')
+            connections = connect(aws_access_key, aws_secret_key, regions)
+        else:
+            logging.error(options.credentials + " is not found")
+            sys.exit(2)
+    else:
+        connections = { region: ec2.connect_to_region(region) for region in regions }
+
+    # 処理の実行
+    if options.apply:
+        # apply tags to EC2
+        if options.file is None:
+            logging.error("apply option is -f(--file) requirement")
+            sys.exit(2)
+
+        if os.path.isfile(options.file) is False:
+            logging.error(options.file + " is not found")
+            sys.exit(2)
+
+        # get tag data
+        to_data     = input_json(options.file)
+        from_data   = describe(connections, {})
+        result_data = diff(to_data, from_data)
+
+        if len(result_data) is 0:
+            logging.info("No change")
+            sys.exit(0)
+
+        for data in result_data:
+            print data["name"] if data["name"] else data["instance_id"]
+            instance_id = data["instance_id"]
+            region = data["region"]
+            delete_tag_name = []
+            update_tag_name = {}
+            for tag,param in data["tags_state"].items():
+                if param["to"] is None:
+                    delete_tag_name.append(tag)
+                    state = colorize("delete", Colors.Red)
+                    param["to"] = "(Undefined)"
+                elif param["from"] is None:
+                    update_tag_name.update({tag:param["to"]})
+                    state = colorize("create", Colors.Green)
+                    param["from"] = "(Undefined)"
+                else:
+                    update_tag_name.update({tag:param["to"]})
+                    state = colorize("update", Colors.Yellow)
+                print "  " + state + " " + tag + ": " + param["from"] + " => " + param["to"]
+
+                if options.dry_run is False:
+                    connection = connections[region]
+                    if update_tag_name:
+                        add_tag(connection, instance_id, update_tag_name)
+                    if delete_tag_name:
+                        del_tag(connection, instance_id, delete_tag_name)
+        if options.dry_run is True:
+            print "(dry-run mode)"
+    elif options.export:
+        # export tags from EC2
+        filters = options.filter
+        if type(filters) != dict:
+            try:
+                filters = create_filter(json.loads(filters))
+            except:
+                logging.warning("filter argment, invalid error")
+                sys.exit(1)
+        output(describe(connections, filters), options.file)
+    else:
+        parser.print_help()
+
+if __name__ == '__main__':
+    main()
