@@ -126,7 +126,7 @@ $ tapewriter -r ap-northeast-1 --apply example.json
 
 ## Licence
 
-[MIT](https://github.com/tcnksm/tool/blob/master/LICENCE)
+MIT
 
 ## Author
 
