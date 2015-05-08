@@ -49,12 +49,12 @@ def describe(connections, filters={}):
     for region,connection in connections.items():
         if connection is not None:
             for instances in connection.get_all_instances(filters=filters):
-                instance_data = {}
-                instance = instances.instances[0]
-                instance_data["id"]     = instance.id
-                instance_data["region"] = region
-                instance_data["tags"]   = instance.tags
-                data["instances"].append(instance_data)
+                for i in instances.instances:
+                    instance_data = {}
+                    instance_data["id"]     = i.id
+                    instance_data["region"] = region
+                    instance_data["tags"]   = i.tags
+                    data["instances"].append(instance_data)
         else:
             logging.warning(region + " is not defined")
     return data
